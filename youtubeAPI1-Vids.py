@@ -11,16 +11,16 @@ SCOPE RULES (everything below enforces the paper's title)
 
 Setup:
   1. Google Cloud Console -> project -> enable "YouTube Data API v3" -> Create API key
-  2. pip install requests pandas
-  3. Windows (cmd):  set YOUTUBE_API_KEY=your_key_here   (same window you run the script in)
-  4. python scrape_youtube_mbg.py
+  2. Follow README.md to create a venv and run run_pipeline.py.
 Workflow:
-  DISCOVER_ONLY = True  -> writes candidates_youtube.csv (accepted) + rejected_youtube.csv (audit)
-  pick IDs -> SEED_VIDEO_IDS, set DISCOVER_ONLY = False -> collects comments
+  python run_pipeline.py --mode discover -> candidate and rejected video CSVs
+  review candidate IDs -> python run_pipeline.py --mode collect --candidates <CSV>
 """
 import os
+import json
 import re
 import sys
+from datetime import datetime, timezone
 from functools import lru_cache
 
 import pandas as pd
@@ -51,12 +51,14 @@ EXCLUDE_VIDEO_IDS = {
     "gTXqHbqAEjM",  # BPOM budget
 }
 
-DISCOVER_ONLY = False         # True: search + save candidate/rejected CSVs, then stop
+DISCOVER_ONLY = os.environ.get("MBG_MODE") == "discover"
 
 SEED_VIDEO_IDS = []          # optional: paste video_id values here to override the CSV
 # If SEED_VIDEO_IDS is empty, the videos are read from this file (written by discovery mode).
 # Delete rows from it in Excel to drop videos you don't want; the script uses what is left.
-CANDIDATES_CSV = "candidates_youtube.csv"
+CANDIDATES_CSV = os.environ.get("MBG_CANDIDATES_CSV", "candidates_youtube.csv")
+INTERIM_DIR = os.environ.get("MBG_INTERIM_DIR", ".")
+PROCESSED_DIR = os.environ.get("MBG_PROCESSED_DIR", ".")
 # False: seed videos that fail the scope check keep only comments that themselves contain
 #        budget terms. True: keep all comments of every seed (only after you verified them).
 SEED_ASSUME_RELEVANT = False
@@ -113,6 +115,7 @@ def has_any(text, terms):
 def api_get(endpoint, **params):
     """Returns parsed JSON, or {"_error": reason} on failure. Always logs why."""
     params = {k: v for k, v in params.items() if v is not None}
+    audit_params = dict(params)  # never persist the API key
     params["key"] = API_KEY
     STATS["calls"] += 1
     STATS["units"] += 100 if endpoint == "search" else 1
@@ -123,7 +126,14 @@ def api_get(endpoint, **params):
         STATS["errors"]["network"] = STATS["errors"].get("network", 0) + 1
         return {"_error": "network"}
     if r.status_code == 200:
-        return r.json()
+        data = r.json()
+        raw_log = os.environ.get("MBG_RAW_LOG")
+        if raw_log:
+            with open(raw_log, "a", encoding="utf-8") as out:
+                out.write(json.dumps({"fetched_at_utc": datetime.now(timezone.utc).isoformat(),
+                                      "endpoint": endpoint, "parameters": audit_params,
+                                      "response": data}, ensure_ascii=False) + "\n")
+        return data
 
     try:
         err = r.json()["error"]
@@ -231,7 +241,7 @@ def rank_videos(ids):
 def save_candidates():
     if REJECTED:
         pd.DataFrame(REJECTED).drop_duplicates(subset=["video_id"]).sort_values(
-            "n_comments", ascending=False).to_csv("rejected_youtube.csv", index=False)
+            "n_comments", ascending=False).to_csv(os.path.join(INTERIM_DIR, "rejected_youtube.csv"), index=False)
     print(f"\nFunnel: {FUNNEL}")
     if not CANDIDATES:
         print("[DIAGNOSIS] No video passed the scope check. See rejected_youtube.csv for why "
@@ -241,15 +251,15 @@ def save_candidates():
     cdf = pd.DataFrame(CANDIDATES).drop_duplicates(subset=["video_id"])
     cdf = cdf.sort_values("n_comments", ascending=False)
     cdf = cdf[["video_id", "published", "n_comments", "anchors", "video_title", "post_permalink"]]
-    cdf.to_csv("candidates_youtube.csv", index=False)
+    cdf.to_csv(os.path.join(INTERIM_DIR, "candidates_youtube.csv"), index=False)
     print(f"Saved {len(cdf)} accepted candidates -> candidates_youtube.csv (sorted by comments)")
     print(cdf.head(30).drop(columns=["post_permalink"]).to_string(index=False, max_colwidth=55))
     print(f"\nTop 15 videos hold {cdf.head(15)['n_comments'].sum()} comments "
           "(expect roughly 40-60% to survive the comment filters).")
     print("Rejected videos (with reasons) -> rejected_youtube.csv. Skim it for false negatives.")
     print(f"API calls: {STATS['calls']} | est. quota units: {STATS['units']} | errors: {STATS['errors']}")
-    print("Next: choose videos, paste video_id values into SEED_VIDEO_IDS, "
-          "set DISCOVER_ONLY = False, run again.")
+    print("Next: review the candidate CSV, then run: "
+          "python run_pipeline.py --mode collect --candidates <reviewed_csv>")
 
 
 def load_seed_videos(ids):
@@ -386,8 +396,7 @@ def main():
     videos = load_seed_videos(seeds) if seeds else collect_videos()
     print(f"Videos used: {len(videos)}")
     if not videos:
-        print("[DIAGNOSIS] No usable videos. Run with DISCOVER_ONLY = True first, "
-              "or check the seed table above.")
+        print("[DIAGNOSIS] No usable videos. Run discovery first or check the seed table above.")
         print(f"API calls: {STATS['calls']} | est. quota units: {STATS['units']} | errors: {STATS['errors']}")
         return
 
@@ -416,7 +425,7 @@ def main():
     df["created_at"] = df["created_at"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
     core = ["content_id", "platform", "text", "created_at", "content_type", "permalink"]
     df = df[core + [c for c in df.columns if c not in core]]
-    df.to_csv("dataset_mbg_youtube.csv", index=False)
+    df.to_csv(os.path.join(PROCESSED_DIR, "mbg_2027_youtube_comments.csv"), index=False)
 
     print(f"Saved {len(df)} rows from {df['video_id'].nunique()} videos.")
     print(f"Funnel: {FUNNEL}")

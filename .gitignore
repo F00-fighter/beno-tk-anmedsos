@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.py[cod]
+.env
+runs/
+data/raw/
+data/interim/
+data/processed/[0-9]*/
+tmp/
+candidates_youtube.csv
+rejected_youtube.csv
